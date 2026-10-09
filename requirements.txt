@@ -1,0 +1,6 @@
+streamlit>=1.40
+pandas
+pypdf
+python-docx
+anthropic
+openai
