@@ -294,6 +294,73 @@ def guion_a_docx(guion, datos):
 
 
 # ------------------------------------------------------------------
+# Comparativa de candidatos (solo en memoria de la sesión)
+# ------------------------------------------------------------------
+def siguiente_codigo(codigo):
+    """CAND-001 -> CAND-002; si no termina en número, añade -2."""
+    m = re.match(r"^(.*?)(\d+)$", codigo.strip())
+    if not m:
+        return f"{codigo.strip()}-2"
+    return f"{m.group(1)}{int(m.group(2)) + 1:0{len(m.group(2))}d}"
+
+
+def anadir_a_comparativa():
+    """Callback del botón: guarda el candidato actual y prepara el siguiente."""
+    datos = st.session_state["datos"]
+    codigo = st.session_state.get("codigo", "").strip() or "SIN-CODIGO"
+    notas, obs, suma = {}, {}, 0
+    for c in datos["competencias"]:
+        n = c["Competencia"]
+        notas[n] = st.session_state.get(f"nota_{n}", 3)
+        obs[n] = st.session_state.get(f"obs_{n}", "")
+        suma += notas[n] * c["Peso (%)"]
+    media = suma / sum(c["Peso (%)"] for c in datos["competencias"])
+    comp = st.session_state.setdefault("comparativa", {})
+    st.session_state["aviso_comparativa"] = (
+        f"{codigo} actualizado en la comparativa." if codigo in comp
+        else f"{codigo} añadido a la comparativa."
+    )
+    comp[codigo] = {"notas": notas, "obs": obs, "media": round(media, 2)}
+    # Dejar el formulario listo para el siguiente candidato
+    st.session_state["codigo"] = siguiente_codigo(codigo)
+    for c in datos["competencias"]:
+        st.session_state[f"nota_{c['Competencia']}"] = 3
+        st.session_state[f"obs_{c['Competencia']}"] = ""
+
+
+def tabla_comparativa(comp, competencias):
+    """Tabla con una fila por candidato, ordenada de mayor a menor media."""
+    filas = []
+    for codigo, r in comp.items():
+        fila = {"Código": codigo}
+        fila.update({c["Competencia"]: r["notas"].get(c["Competencia"]) for c in competencias})
+        fila["Media ponderada"] = r["media"]
+        filas.append(fila)
+    df = pd.DataFrame(filas).sort_values("Media ponderada", ascending=False).reset_index(drop=True)
+    df.insert(0, "Posición", range(1, len(df) + 1))
+    return df
+
+
+def comparativa_a_excel(df, comp, datos):
+    """Excel con dos hojas: resumen comparativo y detalle con observaciones."""
+    detalle = [
+        {"Código": cod, "Competencia": c["Competencia"], "Peso (%)": c["Peso (%)"],
+         "Puntuación (1-5)": r["notas"].get(c["Competencia"]),
+         "Observaciones": r["obs"].get(c["Competencia"], "")}
+        for cod, r in comp.items() for c in datos["competencias"]
+    ]
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as xw:
+        df.to_excel(xw, sheet_name="Comparativa", index=False)
+        pd.DataFrame(detalle).to_excel(xw, sheet_name="Detalle", index=False)
+        for hoja in xw.book.worksheets:
+            for col in hoja.columns:
+                ancho = max(len(str(c.value or "")) for c in col) + 2
+                hoja.column_dimensions[col[0].column_letter].width = min(ancho, 60)
+    return buffer.getvalue()
+
+
+# ------------------------------------------------------------------
 # Interfaz
 # ------------------------------------------------------------------
 cfg = configuracion_ia()
@@ -379,6 +446,7 @@ with tab1:
                 try:
                     guion = generar_guion(datos, cfg) if cfg else guion_demo(datos)
                     st.session_state["guion"], st.session_state["datos"] = guion, datos
+                    st.session_state["comparativa"] = {}  # nueva convocatoria
                     st.success("Guion generado. Revíselo en la pestaña 2.")
                 except Exception as e:
                     st.error(f"No se pudo generar el guion: {e}")
@@ -434,11 +502,13 @@ with tab3:
         st.info("Genere primero un guion en la pestaña 1.")
     else:
         datos = st.session_state["datos"]
-        codigo = st.text_input("Código de candidato/a (no use nombres)", value="CAND-001")
+        st.session_state.setdefault("codigo", "CAND-001")
+        codigo = st.text_input("Código de candidato/a (no use nombres)", key="codigo")
         filas = []
         for c in datos["competencias"]:
             col1, col2 = st.columns([1, 2])
-            nota = col1.slider(c["Competencia"], 1, 5, 3, key=f"nota_{c['Competencia']}")
+            st.session_state.setdefault(f"nota_{c['Competencia']}", 3)
+            nota = col1.slider(c["Competencia"], 1, 5, key=f"nota_{c['Competencia']}")
             obs = col2.text_input("Observaciones", key=f"obs_{c['Competencia']}")
             filas.append(
                 {"Código": codigo, "Competencia": c["Competencia"], "Peso (%)": c["Peso (%)"],
@@ -463,3 +533,37 @@ with tab3:
             file_name=f"puntuacion_{codigo}.csv",
             mime="text/csv",
         )
+
+        # --- Comparativa de candidatos ---------------------------------
+        st.divider()
+        st.subheader("👥 Comparativa de candidatos")
+        st.caption(
+            "Pulse el botón al terminar cada entrevista. Los datos solo se guardan mientras "
+            "la página esté abierta: descargue el Excel antes de cerrarla."
+        )
+        st.button("➕ Añadir candidato a la comparativa", type="primary", on_click=anadir_a_comparativa)
+        if st.session_state.get("aviso_comparativa"):
+            st.success(st.session_state.pop("aviso_comparativa"))
+
+        comp = st.session_state.get("comparativa", {})
+        if not comp:
+            st.info("Aún no hay candidatos en la comparativa.")
+        else:
+            df_comp = tabla_comparativa(comp, datos["competencias"])
+            st.dataframe(df_comp, hide_index=True, width="stretch")
+            st.bar_chart(df_comp.set_index("Código")["Media ponderada"], horizontal=True)
+            st.caption(
+                "La clasificación ordena las puntuaciones que ha dado el entrevistador; "
+                "no es una decisión automática de selección."
+            )
+            c1, c2, c3 = st.columns([2, 2, 1])
+            c1.download_button(
+                "📥 Descargar comparativa (.xlsx)",
+                data=comparativa_a_excel(df_comp, comp, datos),
+                file_name=f"comparativa_{datos['puesto'].replace(' ', '_')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+            quitar = c2.selectbox("Quitar candidato", ["—"] + list(comp.keys()), label_visibility="collapsed")
+            if c3.button("Quitar") and quitar != "—":
+                comp.pop(quitar, None)
+                st.rerun()
